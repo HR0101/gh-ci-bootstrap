@@ -19,6 +19,7 @@ jobs:
     # リポごとに挙動を変えたい場合はコメントを外して調整できます:
     # with:
     #   enable-no-emoji: true
+    #   strict-emoji: false
     #   enable-apple: true
     #   max-file-size-mb: 10
     #   always-run-builds: false

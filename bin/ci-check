@@ -10,7 +10,21 @@ set -euo pipefail
 #   ci-check            # 未追跡ファイル含む（.gitignore 除外）全ファイルを検査
 #   ci-check --staged   # ステージ済み（git add 済み）の変更だけ検査
 #   ci-check --tracked  # Git 追跡済みファイルのみ検査
+#   ci-check --doctor   # 依存ツール診断を表示
 # =============================================================================
+
+for arg in "$@"; do
+  case "$arg" in
+    --doctor|-h|--help)
+      CHECKER="$HOME/.local/share/gh-wrapper/repo_check.py"
+      if [ ! -f "$CHECKER" ]; then
+        SCRIPT_DIR="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+        CHECKER="$(CDPATH= cd "$SCRIPT_DIR/.." && pwd -P)/scripts/repo_check.py"
+      fi
+      exec python3 "$CHECKER" "$@"
+      ;;
+  esac
+done
 
 if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   echo "Error: [ci-check] Not inside a git repository." >&2
