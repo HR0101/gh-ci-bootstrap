@@ -1522,7 +1522,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ needs.repo-checks.outputs.python_installer != 'uv' }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ needs.repo-checks.outputs.python_version }}
           python-version-file: ${{ needs.repo-checks.outputs.python_version_file }}
