@@ -68,7 +68,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## 制御オプション・スキップ方法
 
-* **ローカル手動チェック**: `ci-check`（全体）または `ci-check --staged`（ステージ済みのみ）
+* **ローカル手動チェック**: `ci-check`（全体），`ci-check --staged`（ステージ済みのみ），`ci-check --doctor`（依存ツール診断），`ci-check --strict-emoji`（`U+FE0F` 無しの記号も厳格検出）
 * **`pre-commit` を 1 回だけスキップ**: `CI_CHECK_SKIP=1 git commit ...`
 * **`pre-commit` をリポ単位で無効化**: `git config hooks.skipPreCommit true`
 * **`gh` ラッパー / `pre-push` を 1 回だけスキップ**: `GH_SKIP_CI_INIT=1 gh repo create ...` または `GH_SKIP_CI_INIT=1 git push`

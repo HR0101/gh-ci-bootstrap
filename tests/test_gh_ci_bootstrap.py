@@ -21,6 +21,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 UNINSTALL_SH = REPO_ROOT / "uninstall.sh"
 
 ISOLATE_UNSET_KEYS = (
+    "GITHUB_ACTIONS",
     "GH_SKIP_CI_INIT",
     "CI_CHECK_SKIP",
     "GH_CI_OWNER",
