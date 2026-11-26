@@ -254,19 +254,44 @@ def test_repo_check_features_and_exit_codes():
         res_st = run([sys.executable, str(REPO_CHECK_PY), "--staged"], cwd=clean, home_dir=tmp, check=False)
         assert res_st.returncode == 1 and "1:foo.txt" in res_st.stdout
 
-        # Dirty repo: .envrc, terraform.tfstate, FE0F symbol, deeply nested JSON RecursionError, broken plist
+        # Dirty repo: .envrc, terraform.tfstate, FE0F symbol, invalid JSON, broken plist
         dirty = tmp / "dirty"
         init_git(dirty, home_dir=tmp)
         (dirty / ".envrc").write_text("export FOO=bar\n", encoding="utf-8")
         (dirty / "terraform.tfstate").write_text("{}\n", encoding="utf-8")
         (dirty / "fe0f.txt").write_text("phone \u260e\ufe0f\n", encoding="utf-8")
-        (dirty / "deep.json").write_text("[" * 1200 + "1" + "]" * 1200, encoding="utf-8")
+        (dirty / "bad.json").write_text("{invalid json}\n", encoding="utf-8")
         (dirty / "Broken.plist").write_text("<plist><dict><key>x</dict></plist>\n", encoding="utf-8")
         run(["git", "add", "."], cwd=dirty, home_dir=tmp)
         res_d = run([sys.executable, str(REPO_CHECK_PY), "--tracked", "--ci"], cwd=dirty, home_dir=tmp, check=False)
         assert res_d.returncode == 1
-        for expected in [".envrc", "terraform.tfstate", "fe0f.txt,line=1", "deep.json", "Broken.plist"]:
+        for expected in [".envrc", "terraform.tfstate", "fe0f.txt,line=1", "bad.json", "Broken.plist"]:
             assert expected in res_d.stdout, f"Missing '{expected}' in:\n{res_d.stdout}"
+
+
+def test_repo_check_handles_json_recursion_error(monkeypatch):
+    """M5: JSON RecursionError must be reported as syntax error (exit 1), never uncaught crash (exit 3)."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import repo_check  # type: ignore
+
+        with tempfile.TemporaryDirectory(prefix="gh-ci-rec-") as tmp_str:
+            tmp = Path(tmp_str)
+            repo = tmp / "r"
+            init_git(repo, home_dir=tmp)
+            (repo / "deep.json").write_text('{"a": 1}\n', encoding="utf-8")
+            run(["git", "add", "deep.json"], cwd=repo, home_dir=tmp)
+
+            def raise_rec(*args, **kwargs):
+                raise RecursionError("maximum recursion depth exceeded")
+
+            monkeypatch.setattr(repo_check.json, "loads", raise_rec)
+            monkeypatch.chdir(repo)
+            args = repo_check.argparse.Namespace(staged=False, tracked=True, ci=False, strict_emoji=False, doctor=False, quiet=True)
+            code = repo_check.run_checker(args)
+            assert code == repo_check.EXIT_VIOLATION
+    finally:
+        sys.path.pop(0)
 
 
 def test_stack_detection_and_changed_files_filter():
