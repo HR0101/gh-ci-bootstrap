@@ -10,7 +10,11 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+COMMON_CI = REPO_ROOT / ".github" / "workflows" / "common-ci.yml"
+REPO_CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 CI_TEMPLATE = REPO_ROOT / "templates" / "ci.yml"
+REPO_CHECK_PY = REPO_ROOT / "scripts" / "repo_check.py"
+DEPENDABOT_GEN = REPO_ROOT / "scripts" / "generate_dependabot.py"
 INSTALL_SH = REPO_ROOT / "install.sh"
 UNINSTALL_SH = REPO_ROOT / "uninstall.sh"
 
@@ -51,8 +55,8 @@ def load_yaml(path: Path) -> dict:
         return json.loads(res.stdout)
 
 
-def extract_py_heredoc(run_block: str) -> str:
-    m = re.search(r"<<\s*'PYEOF'\n(.*?)\nPYEOF", run_block, flags=re.S)
+def extract_py_heredoc(run_block: str, marker: str = "PYEOF") -> str:
+    m = re.search(rf"<<\s*'{marker}'\n(.*?)\n{marker}", run_block, flags=re.S)
     assert m is not None
     return m.group(1)
 
@@ -92,9 +96,12 @@ def parse_github_output(path: Path) -> dict:
 def test_shell_scripts_syntax():
     scripts = [
         REPO_ROOT / "bin" / "gh",
+        REPO_ROOT / "bin" / "ci-check",
         REPO_ROOT / "scripts" / "ci-init",
         REPO_ROOT / "scripts" / "pre-push-ci-init",
+        REPO_ROOT / "scripts" / "pre-commit-ci-check",
         REPO_ROOT / "hooks" / "pre-push",
+        REPO_ROOT / "hooks" / "pre-commit",
         INSTALL_SH,
         UNINSTALL_SH,
     ]
@@ -103,37 +110,50 @@ def test_shell_scripts_syntax():
         assert res.returncode == 0, f"bash -n failed for {script}:\n{res.stderr}"
 
 
-def test_ci_template_matches_repo_workflow():
-    repo_ci = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-    assert repo_ci.read_text(encoding="utf-8") == CI_TEMPLATE.read_text(encoding="utf-8")
+def test_common_ci_in_sync_with_repo_check():
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import sync_workflows  # type: ignore
+
+        expected = sync_workflows.render_common_ci()
+    finally:
+        sys.path.pop(0)
+    assert COMMON_CI.read_text(encoding="utf-8") == expected, (
+        "common-ci.yml is out of sync with scripts/repo_check.py; run python3 scripts/sync_workflows.py"
+    )
 
 
-def test_ci_template_yaml_and_step_syntax():
-    wf = load_yaml(CI_TEMPLATE)
-    assert set(wf["jobs"].keys()) == {"repo-checks", "node", "python", "apple", "flutter-dart", "dotnet"}
-    assert wf["jobs"]["apple"]["runs-on"] == "macos-26"
-    assert "github.run_id" in str(wf["concurrency"]["group"])
-    for jname, job in wf["jobs"].items():
+def test_workflows_and_template_yaml_syntax():
+    common = load_yaml(COMMON_CI)
+    on_section = common.get("on") or common.get(True) or common.get("true") or {}
+    assert "workflow_call" in on_section
+    assert set(common["jobs"].keys()) == {"repo-checks", "node", "python", "apple", "flutter-dart", "dotnet"}
+    assert common["jobs"]["apple"]["runs-on"] == "macos-26"
+
+    for jname, job in common["jobs"].items():
         for step in job["steps"]:
             if "run" in step:
                 bash_src = re.sub(r"\$\{\{.*?\}\}", "DUMMY", step["run"])
                 res = run(["bash", "-n"], stdin_text=bash_src, check=False)
                 assert res.returncode == 0, f"Bash syntax error in {jname}/{step['name']}:\n{res.stderr}"
 
+    tmpl = load_yaml(CI_TEMPLATE)
+    assert "HR0101/gh-ci-bootstrap/.github/workflows/common-ci.yml@v1" in tmpl["jobs"]["common"]["uses"]
 
-def test_ci_checks_clean_and_dirty():
-    wf = load_yaml(CI_TEMPLATE)
-    checks_py = extract_py_heredoc(wf["jobs"]["repo-checks"]["steps"][2]["run"])
+    repo_wf = load_yaml(REPO_CI)
+    assert repo_wf["jobs"]["common"]["uses"] == "./.github/workflows/common-ci.yml"
 
+
+def test_repo_check_clean_dirty_and_extended_emojis():
     with tempfile.TemporaryDirectory(prefix="gh-ci-checks-") as tmp_str:
         tmp = Path(tmp_str)
 
-        # Clean repo (including ci.yml itself, custom YAML tags, Firebase public config, Apple plist, Dockerfile)
+        # Clean repo (including Japanese symbols ★☆♪→※, custom YAML tags, Firebase public config, Apple plist, Dockerfile)
         clean = tmp / "clean"
         (clean / ".github" / "workflows").mkdir(parents=True)
         init_git(clean)
         shutil.copy(CI_TEMPLATE, clean / ".github" / "workflows" / "ci.yml")
-        (clean / "README.md").write_text("Title\n=======\n\u2605 \u266a ok\n", encoding="utf-8")
+        (clean / "README.md").write_text("Title\n=======\n\u2605 \u2606 \u266a \u2192 \u203b ok\n", encoding="utf-8")
         (clean / "cfn.yml").write_text("Resources:\n  B:\n    Name: !Sub '${AWS::StackName}-b'\n", encoding="utf-8")
         gkey = "AI" + "za" + "AbCdEfGhIjKlMnOpQrStUvWxYz098765432"
         (clean / "GoogleService-Info.plist").write_text(
@@ -142,27 +162,43 @@ def test_ci_checks_clean_and_dirty():
         )
         (clean / "Dockerfile").write_text("FROM alpine:3.20\nCOPY . /app\n", encoding="utf-8")
         run(["git", "add", "."], cwd=clean)
-        res = run([sys.executable, "-c", checks_py], cwd=clean, check=False)
+        res = run([sys.executable, str(REPO_CHECK_PY), "--tracked", "--ci"], cwd=clean, check=False)
         assert res.returncode == 0, f"Clean repo failed:\n{res.stdout}\n{res.stderr}"
 
-        # Dirty repo (emoji, secret with trailing '-', conflict marker, broken plist, broken Dockerfile)
+        # Dirty repo (standard emoji + newly covered bare symbols U+270C/2699/2702/23F8, secret with trailing '-', conflict, broken plist, broken Dockerfile)
         dirty = tmp / "dirty"
         init_git(dirty)
-        (dirty / "emoji.txt").write_text("hi \U0001F680\n", encoding="utf-8")
+        (dirty / "emoji.txt").write_text("hi \U0001F680 \u270c \u2699 \u2702 \u23f8\n", encoding="utf-8")
         (dirty / "leak.py").write_text('K = "' + "AI" + "za" + 'AbCdEfGhIjKlMnOpQrStUvWxYz09876543-"\n', encoding="utf-8")
         (dirty / "conflict.txt").write_text("<" * 7 + " HEAD\nleft\n", encoding="utf-8")
         (dirty / "Broken.plist").write_text("<plist><dict><key>x</dict></plist>\n", encoding="utf-8")
         (dirty / "Dockerfile").write_text("COYP . /app\n", encoding="utf-8")
         run(["git", "add", "."], cwd=dirty)
-        res = run([sys.executable, "-c", checks_py], cwd=dirty, check=False)
+        res = run([sys.executable, str(REPO_CHECK_PY), "--tracked", "--ci"], cwd=dirty, check=False)
         assert res.returncode == 1
-        for expected in ["emoji.txt,line=1", "leak.py,line=1", "conflict.txt,line=1", "Broken.plist", "COYP"]:
+        for expected in ["col=4", "col=6", "col=8", "col=10", "col=12", "leak.py,line=1", "conflict.txt,line=1", "Broken.plist", "COYP"]:
             assert expected in res.stdout, f"Missing '{expected}' in:\n{res.stdout}"
 
 
-def test_stack_detection():
-    wf = load_yaml(CI_TEMPLATE)
-    detect_py = extract_py_heredoc(wf["jobs"]["repo-checks"]["steps"][1]["run"])
+def test_stack_detection_and_changed_files_filter():
+    common = load_yaml(COMMON_CI)
+    detect_py = extract_py_heredoc(common["jobs"]["repo-checks"]["steps"][1]["run"])
+
+    # Unit-test computeStackRunFlags directly for cost-saving path filter
+    ns = {}
+    exec(compile(detect_py, "<detect>", "exec"), ns)
+    assert ns["computeStackRunFlags"](["README.md", ".gitignore", ".github/dependabot.yml"]) == {
+        "node": False, "python": False, "apple": False, "dart": False, "dotnet": False
+    }
+    assert ns["computeStackRunFlags"](["src/index.ts"]) == {
+        "node": True, "python": False, "apple": False, "dart": False, "dotnet": False
+    }
+    assert ns["computeStackRunFlags"](["Sources/App/ContentView.swift"]) == {
+        "node": False, "python": False, "apple": True, "dart": False, "dotnet": False
+    }
+    assert ns["computeStackRunFlags"]([".github/workflows/ci.yml"]) == {
+        "node": True, "python": True, "apple": True, "dart": True, "dotnet": True
+    }
 
     with tempfile.TemporaryDirectory(prefix="gh-ci-detect-") as tmp_str:
         tmp = Path(tmp_str)
@@ -178,15 +214,50 @@ def test_stack_detection():
         run(["git", "add", "."], cwd=r)
 
         out_file = tmp / "gh_out.txt"
-        run([sys.executable, "-c", detect_py], cwd=r, env_extra={"GITHUB_OUTPUT": str(out_file)})
+        run(
+            [sys.executable, "-c", detect_py],
+            cwd=r,
+            env_extra={"GITHUB_OUTPUT": str(out_file), "EVENT_NAME": "workflow_dispatch"},
+        )
         kv = parse_github_output(out_file)
         assert kv["has_node"] == "true" and kv["node_pm"] == "yarn" and kv["node_yarn_berry"] == "true"
         assert kv["has_python"] == "true" and kv["python_version"] == "3.13"
         assert kv["has_apple"] == "true" and kv["apple_kind"] == "xcodeproj" and kv["apple_project"] == "My App.xcodeproj"
         assert kv["has_dart_flutter"] == "true" and kv["dart_kind"] == "flutter" and kv["has_dart_tests"] == "true"
 
+        # Real git push diff: docs-only commit skips heavy language jobs
+        run(["git", "commit", "-q", "-m", "initial"], cwd=r)
+        before_sha = run(["git", "rev-parse", "HEAD"], cwd=r).stdout.strip()
+        (r / "README.md").write_text("# updated docs\n", encoding="utf-8")
+        run(["git", "add", "README.md"], cwd=r)
+        run(["git", "commit", "-q", "-m", "docs"], cwd=r)
+        out_docs = tmp / "gh_out_docs.txt"
+        run(
+            [sys.executable, "-c", detect_py],
+            cwd=r,
+            env_extra={"GITHUB_OUTPUT": str(out_docs), "EVENT_NAME": "push", "BEFORE_SHA": before_sha},
+        )
+        kv_docs = parse_github_output(out_docs)
+        assert kv_docs["has_node"] == "false"
+        assert kv_docs["has_python"] == "false"
+        assert kv_docs["has_apple"] == "false"
+        assert kv_docs["has_dart_flutter"] == "false"
 
-def test_install_wrapper_prepush_and_uninstall():
+
+def test_dependabot_generator():
+    with tempfile.TemporaryDirectory(prefix="gh-ci-dep-") as tmp_str:
+        tmp = Path(tmp_str)
+        (tmp / "package.json").write_text("{}", encoding="utf-8")
+        (tmp / "uv.lock").write_text("", encoding="utf-8")
+        (tmp / "Package.swift").write_text("", encoding="utf-8")
+        (tmp / "pubspec.yaml").write_text("", encoding="utf-8")
+        (tmp / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+        res = run([sys.executable, str(DEPENDABOT_GEN), str(tmp)])
+        for eco in ('"github-actions"', '"npm"', '"uv"', '"swift"', '"pub"', '"docker"'):
+            assert eco in res.stdout
+
+
+def test_install_ci_check_precommit_wrapper_prepush_and_uninstall():
     with tempfile.TemporaryDirectory(prefix="gh-ci-e2e-") as tmp_str:
         tmp = Path(tmp_str)
         fake_home = tmp / "home"
@@ -215,15 +286,34 @@ def test_install_wrapper_prepush_and_uninstall():
         # Install into isolated HOME
         run([str(INSTALL_SH), "--owner", "testuser"], env_extra=base_env)
         assert (fake_home / ".local/bin/gh").is_symlink()
+        assert (fake_home / ".local/bin/ci-check").is_symlink()
         assert (fake_home / ".git-templates/hooks/pre-push").is_symlink()
+        assert (fake_home / ".git-templates/hooks/pre-commit").is_symlink()
 
-        # Test gh wrapper with --source=. --push
+        # Test pre-commit blocks staged emoji, passes once cleaned, and allows untracked dirty working file
+        proj = tmp / "proj"
+        init_git(proj, with_commit=True, env_extra=base_env)
+        assert (proj / ".git/hooks/pre-commit").is_file()
+
+        (proj / "bad.txt").write_text("oops \U0001F680\n", encoding="utf-8")
+        run(["git", "add", "bad.txt"], cwd=proj, env_extra=base_env)
+        res_block = run(["git", "commit", "-m", "should block"], cwd=proj, env_extra=base_env, check=False)
+        assert res_block.returncode != 0, "pre-commit should block staged emoji!"
+
+        # Bypass with CI_CHECK_SKIP=1 works, or fix file -> ci-check & commit pass
+        (proj / "bad.txt").write_text("clean text\n", encoding="utf-8")
+        run(["git", "add", "bad.txt"], cwd=proj, env_extra=base_env)
+        run(["ci-check", "--staged"], cwd=proj, env_extra=base_env)
+        run(["git", "commit", "-m", "clean commit"], cwd=proj, env_extra=base_env)
+
+        # Test gh wrapper with --source=. --push generates ci.yml + dependabot.yml + .editorconfig + .gitattributes
         bare = tmp / "remote.git"
         bare.mkdir()
         run(["git", "init", "--bare", "-q", "-b", "main"], cwd=bare, env_extra=base_env)
+        (proj / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+        run(["git", "add", "package.json"], cwd=proj, env_extra=base_env)
+        run(["git", "commit", "-q", "-m", "add pkg"], cwd=proj, env_extra=base_env)
 
-        proj = tmp / "proj"
-        init_git(proj, with_commit=True, env_extra=base_env)
         (proj / "staged.txt").write_text("keep staged\n", encoding="utf-8")
         run(["git", "add", "staged.txt"], cwd=proj, env_extra=base_env)
 
@@ -234,10 +324,16 @@ def test_install_wrapper_prepush_and_uninstall():
         )
         assert res.stdout.strip() == "https://github.com/testuser/demo"
         assert (proj / ".github/workflows/ci.yml").is_file()
+        assert (proj / ".github/dependabot.yml").is_file()
+        assert '"npm"' in (proj / ".github/dependabot.yml").read_text(encoding="utf-8")
+        assert (proj / ".editorconfig").is_file()
+        assert (proj / ".gitattributes").is_file()
         assert run(["git", "diff", "--cached", "--name-only"], cwd=proj, env_extra=base_env).stdout.strip() == "staged.txt"
-        assert ".github/workflows/ci.yml" in run(["git", "ls-tree", "-r", "--name-only", "main"], cwd=bare).stdout
+        remote_files = run(["git", "ls-tree", "-r", "--name-only", "main"], cwd=bare).stdout
+        assert ".github/workflows/ci.yml" in remote_files
+        assert ".github/dependabot.yml" in remote_files
 
-        # Test pre-push hook on empty remote & detached HEAD skip
+        # Test pre-push hook on empty remote
         empty_bare = tmp / "empty.git"
         empty_bare.mkdir()
         run(["git", "init", "--bare", "-q", "-b", "main"], cwd=empty_bare, env_extra=base_env)
@@ -247,8 +343,6 @@ def test_install_wrapper_prepush_and_uninstall():
         run(["git", "remote", "add", "empty_remote", str(empty_bare)], cwd=proj2, env_extra=base_env)
         head_sha = run(["git", "rev-parse", "HEAD"], cwd=proj2, env_extra=base_env).stdout.strip()
         hook = proj2 / ".git/hooks/pre-push"
-        assert hook.is_file()
-
         res_pp = run(
             [str(hook), "empty_remote", "https://github.com/testuser/new-app.git"],
             cwd=proj2,
@@ -258,8 +352,11 @@ def test_install_wrapper_prepush_and_uninstall():
         )
         assert res_pp.returncode == 1
         assert (proj2 / ".github/workflows/ci.yml").is_file()
+        assert (proj2 / ".editorconfig").is_file()
 
         # Uninstall cleans up all owned symlinks
         run([str(UNINSTALL_SH)], env_extra=base_env)
         assert not (fake_home / ".local/bin/gh").exists()
+        assert not (fake_home / ".local/bin/ci-check").exists()
         assert not (fake_home / ".git-templates/hooks/pre-push").exists()
+        assert not (fake_home / ".git-templates/hooks/pre-commit").exists()

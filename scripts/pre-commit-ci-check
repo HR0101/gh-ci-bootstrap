@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# グローバル pre-commit フック本体（~/.local/share/gh-wrapper/pre-commit-ci-check）
+#
+# `~/.git-templates/hooks/pre-commit` のスタブから exec で呼ばれる本体スクリプト．
+# コミット対象（ステージ済み）ファイルに対して，絵文字・シークレット・機密ファイル・
+# 巨大ファイル・コンフリクト・構文エラーをコミット前にブロックする．
+#
+# 制御方法:
+#   - 1回だけスキップ:   CI_CHECK_SKIP=1 git commit ...  （または git commit --no-verify）
+#   - リポ単位で無効化:  git config hooks.skipPreCommit true
+# =============================================================================
+
+# 予期しないエラーで作業を止めないフェイルセーフ（チェック検出失敗時は明示的に exit 1）
+trap 'exit 0' ERR
+
+if [ "${CI_CHECK_SKIP:-}" = "1" ] || [ "${CI_CHECK_SKIP:-}" = "true" ]; then
+  exit 0
+fi
+
+if [ "$(git config --bool --get hooks.skipPreCommit 2>/dev/null || echo false)" = "true" ]; then
+  exit 0
+fi
+
+# ステージ済みファイルが 0 件なら何もしない
+if [ -z "$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)" ]; then
+  exit 0
+fi
+
+CHECKER="$HOME/.local/share/gh-wrapper/repo_check.py"
+if [ ! -f "$CHECKER" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+
+# ホームディレクトリ直下のドットファイル管理リポ等は意図しない誤爆を避けるためスキップ可能
+if [ "$REPO_ROOT" = "$HOME" ]; then
+  exit 0
+fi
+
+trap - ERR
+if ! (CDPATH= cd "$REPO_ROOT" && python3 "$CHECKER" --staged --quiet); then
+  cat >&2 << 'EOF'
+
+[pre-commit] ステージ済みファイルで CI 事前チェックに失敗しました．
+[pre-commit] 上記エラーを修正して再度 git add / commit してください．
+             （1回だけスキップ: CI_CHECK_SKIP=1 git commit ...）
+             （このリポで無効化: git config hooks.skipPreCommit true）
+EOF
+  exit 1
+fi

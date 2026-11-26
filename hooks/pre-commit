@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# 本体を呼び出す薄いスタブ（本体を更新するとテンプレート適用済みの全リポジトリに即時反映される）
+HOOK_BODY="$HOME/.local/share/gh-wrapper/pre-commit-ci-check"
+if [ -x "$HOOK_BODY" ]; then
+  exec "$HOOK_BODY" "$@"
+fi
+exit 0

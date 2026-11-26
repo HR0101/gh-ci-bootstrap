@@ -2,17 +2,20 @@
 set -euo pipefail
 
 # =============================================================================
-# 共通 CI 初期化スクリプト（~/.local/share/gh-wrapper/ci-init）
+# 共通 CI & リポジトリ初期設定スクリプト（~/.local/share/gh-wrapper/ci-init）
 #
 # `gh` ラッパーおよび `pre-push` フックの双方から呼び出され，対象リポジトリの
-# ルートへ `.github/workflows/ci.yml` を配置し，必要に応じて単独コミットする．
+# ルートへ未作成の標準設定ファイル群を配置し，必要に応じて単独コミットする．
 #
-# 使い方:
-#   ci-init <target_dir> [--commit-mode auto|require] [--allow-existing-dir] [--status-file <path>]
+# 配置対象（まだ存在しないファイルのみ作成し，既存ファイルは一切上書きしない）:
+#   - .github/workflows/ci.yml
+#   - .github/dependabot.yml
+#   - .editorconfig
+#   - .gitattributes
 #
-# 出力規約:
-#   - 全てのログと git 出力は stderr (>&2) へ出し，stdout を汚染しない．
-#   - --status-file を渡すと，処理結果（committed / created / skipped）を書き出す．
+# 環境変数:
+#   GH_CI_TEMPLATE=/path/to.yml  : ci.yml テンプレートの上書き
+#   GH_CI_MINIMAL=1              : ci.yml のみ生成（dependabot/editorconfig/gitattributes 省略）
 # =============================================================================
 
 usage() {
@@ -82,15 +85,12 @@ fi
 
 TARGET_DIR="$(CDPATH= cd "$TARGET_ARG" && pwd -P)"
 
-# bare リポジトリやすり抜けを確実に除外するため出力文字列を厳密チェック
 if [ "$(git -C "$TARGET_DIR" rev-parse --is-inside-work-tree 2>/dev/null || echo false)" != "true" ]; then
   echo "[ci-init] Warning: Not a git working tree: $TARGET_DIR" >&2
   write_status "skipped"
   exit 1
 fi
 
-# サブディレクトリ指定でリポジトリルート以外に .github を作ってしまう事故を防ぐ
-# （macOS の大文字小文字差の影響を受けないよう --show-prefix でルート判定する）
 REPO_PREFIX="$(git -C "$TARGET_DIR" rev-parse --show-prefix 2>/dev/null)"
 if [ -n "$REPO_PREFIX" ]; then
   echo "[ci-init] Warning: '$TARGET_DIR' is not the repository root (prefix: '$REPO_PREFIX'). Skipping CI initialization." >&2
@@ -105,7 +105,8 @@ if [ -z "$REPO_ROOT" ]; then
   exit 1
 fi
 
-TEMPLATE_FILE="${GH_CI_TEMPLATE:-$HOME/.local/share/gh-wrapper/ci.yml}"
+SHARE_DIR="$HOME/.local/share/gh-wrapper"
+TEMPLATE_FILE="${GH_CI_TEMPLATE:-$SHARE_DIR/ci.yml}"
 if [ ! -f "$TEMPLATE_FILE" ]; then
   echo "[ci-init] Warning: Template not found at $TEMPLATE_FILE. Skipping." >&2
   write_status "skipped"
@@ -122,20 +123,66 @@ if [ -d "$WORKFLOW_DIR" ] && [ "$ALLOW_EXISTING_DIR" != true ]; then
   exit 0
 fi
 
-# 作業ツリーに未追跡の ci.yml が既にある場合は上書きしない
+files_to_commit=()
+
+# 1. .github/workflows/ci.yml
 if [ ! -f "$CI_FILE" ]; then
   echo "[ci-init] Initializing default CI workflow at $CI_FILE..." >&2
   mkdir -p "$WORKFLOW_DIR"
   cp "$TEMPLATE_FILE" "$CI_FILE"
-  echo "[ci-init] Default CI workflow created." >&2
+  files_to_commit+=("$CI_REL_FILE")
 else
   echo "[ci-init] Found existing $CI_FILE in working tree; reusing it." >&2
+  if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+    if ! git -C "$REPO_ROOT" cat-file -e "HEAD:$CI_REL_FILE" 2>/dev/null; then
+      files_to_commit+=("$CI_REL_FILE")
+    fi
+  fi
+fi
+
+# 2. 追加の標準設定（dependabot.yml / .editorconfig / .gitattributes）
+if [ "${GH_CI_MINIMAL:-}" != "1" ] && [ "${GH_CI_MINIMAL:-}" != "true" ]; then
+  DEP_REL=".github/dependabot.yml"
+  DEP_FILE="$REPO_ROOT/$DEP_REL"
+  DEP_GEN="$SHARE_DIR/generate_dependabot.py"
+  if [ ! -f "$DEP_FILE" ] && [ -f "$DEP_GEN" ]; then
+    mkdir -p "$REPO_ROOT/.github"
+    if python3 "$DEP_GEN" "$REPO_ROOT" > "$DEP_FILE"; then
+      echo "[ci-init] Generated $DEP_REL." >&2
+      files_to_commit+=("$DEP_REL")
+    else
+      rm -f "$DEP_FILE"
+    fi
+  fi
+
+  EC_REL=".editorconfig"
+  EC_FILE="$REPO_ROOT/$EC_REL"
+  EC_TMPL="$SHARE_DIR/editorconfig"
+  if [ ! -f "$EC_FILE" ] && [ -f "$EC_TMPL" ]; then
+    cp "$EC_TMPL" "$EC_FILE"
+    echo "[ci-init] Generated $EC_REL." >&2
+    files_to_commit+=("$EC_REL")
+  fi
+
+  GA_REL=".gitattributes"
+  GA_FILE="$REPO_ROOT/$GA_REL"
+  GA_TMPL="$SHARE_DIR/gitattributes"
+  if [ ! -f "$GA_FILE" ] && [ -f "$GA_TMPL" ]; then
+    cp "$GA_TMPL" "$GA_FILE"
+    echo "[ci-init] Generated $GA_REL." >&2
+    files_to_commit+=("$GA_REL")
+  fi
+fi
+
+if [ "${#files_to_commit[@]}" -eq 0 ]; then
+  write_status "skipped"
+  exit 0
 fi
 
 if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
-  echo "[ci-init] Committing $CI_REL_FILE only..." >&2
-  if ! git -C "$REPO_ROOT" add -- "$CI_REL_FILE" >&2; then
-    echo "[ci-init] Warning: Failed to stage $CI_REL_FILE (e.g. ignored by .gitignore)." >&2
+  echo "[ci-init] Committing initialized files (${files_to_commit[*]})..." >&2
+  if ! git -C "$REPO_ROOT" add -- "${files_to_commit[@]}" >&2; then
+    echo "[ci-init] Warning: Failed to stage files (e.g. ignored by .gitignore)." >&2
     write_status "created"
     if [ "$COMMIT_MODE" = "require" ]; then
       exit 1
@@ -143,11 +190,12 @@ if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
     exit 0
   fi
 
-  if git -C "$REPO_ROOT" commit -m "chore: add default CI workflow" -- "$CI_REL_FILE" >&2; then
+  # pre-commit フックはスキップし，既にステージ済みの他ファイルは絶対に巻き込まない
+  if CI_CHECK_SKIP=1 git -C "$REPO_ROOT" commit -m "chore: add default CI and repository configs" -- "${files_to_commit[@]}" >&2; then
     write_status "committed"
     exit 0
   else
-    echo "[ci-init] Warning: Failed to commit $CI_REL_FILE." >&2
+    echo "[ci-init] Warning: Failed to commit initialized files." >&2
     write_status "created"
     if [ "$COMMIT_MODE" = "require" ]; then
       exit 1
@@ -155,7 +203,7 @@ if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
     exit 0
   fi
 else
-  echo "[ci-init] Initial repository without commits detected. Leaving $CI_REL_FILE for initial commit." >&2
+  echo "[ci-init] Initial repository without commits detected. Leaving generated files for initial commit." >&2
   write_status "created"
   if [ "$COMMIT_MODE" = "require" ]; then
     exit 1

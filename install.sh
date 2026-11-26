@@ -79,7 +79,6 @@ install_file() {
       fi
       rm -f "$dst"
     elif [ -e "$dst" ]; then
-      # 同一内容ならバックアップを作らず差し替え，差分がある場合のみ退避する
       if cmp -s "$src" "$dst"; then
         rm -f "$dst"
       else
@@ -94,17 +93,29 @@ install_file() {
 
 chmod +x \
   "$REPO_DIR/bin/gh" \
+  "$REPO_DIR/bin/ci-check" \
   "$REPO_DIR/scripts/ci-init" \
   "$REPO_DIR/scripts/pre-push-ci-init" \
-  "$REPO_DIR/hooks/pre-push"
+  "$REPO_DIR/scripts/pre-commit-ci-check" \
+  "$REPO_DIR/scripts/repo_check.py" \
+  "$REPO_DIR/scripts/generate_dependabot.py" \
+  "$REPO_DIR/scripts/sync_workflows.py" \
+  "$REPO_DIR/hooks/pre-push" \
+  "$REPO_DIR/hooks/pre-commit"
 
-# 1. gh ラッパー・共通スクリプト・テンプレートを配置
+# 1. CLI ラッパー / ローカルチェッカー / 共通スクリプト / テンプレートを配置
 install_file "$REPO_DIR/bin/gh" "$HOME/.local/bin/gh" true
+install_file "$REPO_DIR/bin/ci-check" "$HOME/.local/bin/ci-check" true
 install_file "$REPO_DIR/scripts/ci-init" "$HOME/.local/share/gh-wrapper/ci-init" true
 install_file "$REPO_DIR/scripts/pre-push-ci-init" "$HOME/.local/share/gh-wrapper/pre-push-ci-init" true
+install_file "$REPO_DIR/scripts/pre-commit-ci-check" "$HOME/.local/share/gh-wrapper/pre-commit-ci-check" true
+install_file "$REPO_DIR/scripts/repo_check.py" "$HOME/.local/share/gh-wrapper/repo_check.py" true
+install_file "$REPO_DIR/scripts/generate_dependabot.py" "$HOME/.local/share/gh-wrapper/generate_dependabot.py" true
 install_file "$REPO_DIR/templates/ci.yml" "$HOME/.local/share/gh-wrapper/ci.yml" false
+install_file "$REPO_DIR/templates/editorconfig" "$HOME/.local/share/gh-wrapper/editorconfig" false
+install_file "$REPO_DIR/templates/gitattributes" "$HOME/.local/share/gh-wrapper/gitattributes" false
 
-# 2. Git テンプレートディレクトリへ pre-push スタブを配置
+# 2. Git テンプレートディレクトリへ pre-push / pre-commit スタブを配置
 TEMPLATE_DIR="$(git config --global --path --get init.templateDir 2>/dev/null || true)"
 if [ -z "$TEMPLATE_DIR" ]; then
   TEMPLATE_DIR="$HOME/.git-templates"
@@ -112,6 +123,7 @@ if [ -z "$TEMPLATE_DIR" ]; then
   echo "Configured git init.templateDir = $TEMPLATE_DIR"
 fi
 install_file "$REPO_DIR/hooks/pre-push" "$TEMPLATE_DIR/hooks/pre-push" true
+install_file "$REPO_DIR/hooks/pre-commit" "$TEMPLATE_DIR/hooks/pre-commit" true
 
 # 3. hooks.ciOwner の確認・設定
 CURRENT_OWNER="$(git config --global --get hooks.ciOwner 2>/dev/null || true)"
