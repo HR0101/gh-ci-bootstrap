@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# gh wrapper（~/.local/bin/gh）
+#
+# `gh repo create` / `gh repo new` に `--source` / `-s` が指定された場合，
+# 本物の `gh` が成功したあとに共通スクリプト `ci-init` で
+# `.github/workflows/ci.yml` を生成＆単独コミットし，`--push` 指定時は
+# 追加コミットもリモートへプッシュする．
+#
+# ※ 対話モード（--source なし）はキャンセル誤爆やホームの .git 誤検出を防ぐため
+#    ラッパー側では介入せず，pre-push フック側で安全に処理する．
+#
+# 環境変数:
+#   GH_SKIP_CI_INIT=1          : 一時的に CI 自動生成をスキップ
+#   GH_CI_TEMPLATE=/path/to.yml: テンプレートファイルの上書き
+# =============================================================================
+
+# 1. 本物の gh バイナリを検出（inode 比較で自分自身を確実に除外）
+REAL_GH=""
+CURRENT_SCRIPT="${BASH_SOURCE[0]}"
+
+while IFS= read -r candidate; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    if ! [ "$candidate" -ef "$CURRENT_SCRIPT" ]; then
+      REAL_GH="$candidate"
+      break
+    fi
+  fi
+done < <(which -a gh 2>/dev/null || true)
+
+if [ -z "$REAL_GH" ]; then
+  if [ -x "/opt/homebrew/bin/gh" ]; then
+    REAL_GH="/opt/homebrew/bin/gh"
+  elif [ -x "/usr/local/bin/gh" ]; then
+    REAL_GH="/usr/local/bin/gh"
+  else
+    echo "Error: [gh-wrapper] Original gh binary not found." >&2
+    exit 1
+  fi
+fi
+
+# 再帰実行防止，および `repo create` / `repo new` 以外は最速で本物へ委譲
+if [ "${GH_WRAPPER_ACTIVE:-}" = "1" ] || \
+   [ "${GH_SKIP_CI_INIT:-}" = "1" ] || \
+   [ "${GH_SKIP_CI_INIT:-}" = "true" ] || \
+   [ "$#" -lt 2 ] || \
+   [ "$1" != "repo" ] || \
+   { [ "$2" != "create" ] && [ "$2" != "new" ]; }; then
+  exec "$REAL_GH" "$@"
+fi
+export GH_WRAPPER_ACTIVE=1
+
+# 2. 引数解析（--source / -s / -sDIR，--push[=bool]，--remote / -r，--help[=bool]，--clone[=bool]，-- に対応）
+has_help=false
+has_clone=false
+has_push=false
+source_dir=""
+remote_name="origin"
+
+args=("$@")
+i=2
+while [ "$i" -lt "${#args[@]}" ]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    --)
+      break
+      ;;
+    --help|--help=true|--help=1)
+      has_help=true
+      ;;
+    --help=false|--help=0)
+      has_help=false
+      ;;
+    -c|--clone|--clone=true|--clone=1)
+      has_clone=true
+      ;;
+    --clone=false|--clone=0)
+      has_clone=false
+      ;;
+    --push|--push=true|--push=1)
+      has_push=true
+      ;;
+    --push=false|--push=0)
+      has_push=false
+      ;;
+    -s|--source)
+      if [ $((i + 1)) -lt "${#args[@]}" ]; then
+        i=$((i + 1))
+        source_dir="${args[$i]}"
+      fi
+      ;;
+    --source=*)
+      source_dir="${arg#--source=}"
+      ;;
+    -s=*)
+      source_dir="${arg#-s=}"
+      ;;
+    -s?*)
+      source_dir="${arg#-s}"
+      ;;
+    -r|--remote)
+      if [ $((i + 1)) -lt "${#args[@]}" ]; then
+        i=$((i + 1))
+        remote_name="${args[$i]}"
+      fi
+      ;;
+    --remote=*)
+      remote_name="${arg#--remote=}"
+      ;;
+    -r=*)
+      remote_name="${arg#-r=}"
+      ;;
+    -r?*)
+      remote_name="${arg#-r}"
+      ;;
+    -d|--description|-g|--gitignore|-h|--homepage|-l|--license|-t|--team|-p|--template)
+      if [ $((i + 1)) -lt "${#args[@]}" ]; then
+        i=$((i + 1))
+      fi
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+# --source なし（対話モード・リモート単独作成），--help，--clone は透過実行のみ
+if [ "$has_help" = true ] || [ "$has_clone" = true ] || [ -z "$source_dir" ]; then
+  exec "$REAL_GH" "$@"
+fi
+
+# 3. 本物の gh を先に実行（実行中の内部 push では pre-push フックの重複発火を抑止）
+gh_status=0
+GH_SKIP_CI_INIT=1 "$REAL_GH" "$@" || gh_status=$?
+
+if [ "$gh_status" -ne 0 ]; then
+  exit "$gh_status"
+fi
+
+# 4. gh が成功した場合のみ CI を初期化（失敗しても gh の成功ステータスは壊さない）
+CI_INIT="$HOME/.local/share/gh-wrapper/ci-init"
+if [ -x "$CI_INIT" ] && [ -d "$source_dir" ]; then
+  target_dir="$(CDPATH= cd "$source_dir" && pwd -P)"
+  status_file="$(mktemp -t gh-ci-init.XXXXXX)"
+  trap 'rm -f "${status_file:-}"' EXIT
+
+  if "$CI_INIT" "$target_dir" --commit-mode auto --status-file "$status_file"; then
+    ci_status="$(cat "$status_file" 2>/dev/null || true)"
+    if [ "$ci_status" = "committed" ] && [ "$has_push" = true ]; then
+      if git -C "$target_dir" remote get-url "$remote_name" >/dev/null 2>&1; then
+        echo "[gh-wrapper] Pushing default CI workflow commit to '$remote_name'..." >&2
+        GH_SKIP_CI_INIT=1 git -C "$target_dir" push "$remote_name" HEAD >&2 \
+          || echo "[gh-wrapper] Warning: Failed to push default CI workflow commit. Run 'git push' manually." >&2
+      fi
+    fi
+  else
+    echo "[gh-wrapper] Warning: Default CI initialization failed, but repository creation succeeded." >&2
+  fi
+  rm -f "$status_file"
+fi
+
+exit "$gh_status"
