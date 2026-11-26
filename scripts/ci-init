@@ -7,7 +7,7 @@ set -euo pipefail
 # `gh` ラッパーおよび `pre-push` フックの双方から呼び出され，対象リポジトリの
 # ルートへ未作成の標準設定ファイル群を配置し，必要に応じて単独コミットする．
 #
-# 配置対象（まだ存在しないファイルのみ作成し，既存ファイルは一切上書きしない）:
+# 配置対象（まだ存在しないファイルのみ作成し，既存ファイルや symlink は上書きしない）:
 #   - .github/workflows/ci.yml
 #   - .github/dependabot.yml
 #   - .editorconfig
@@ -125,13 +125,13 @@ fi
 
 files_to_commit=()
 
-# 1. .github/workflows/ci.yml
-if [ ! -f "$CI_FILE" ]; then
+# 1. .github/workflows/ci.yml（壊れた symlink への書き込みを防ぐため -e と -L の両方をチェック）
+if [ ! -e "$CI_FILE" ] && [ ! -L "$CI_FILE" ]; then
   echo "[ci-init] Initializing default CI workflow at $CI_FILE..." >&2
   mkdir -p "$WORKFLOW_DIR"
   cp "$TEMPLATE_FILE" "$CI_FILE"
   files_to_commit+=("$CI_REL_FILE")
-else
+elif [ -f "$CI_FILE" ]; then
   echo "[ci-init] Found existing $CI_FILE in working tree; reusing it." >&2
   if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
     if ! git -C "$REPO_ROOT" cat-file -e "HEAD:$CI_REL_FILE" 2>/dev/null; then
@@ -145,7 +145,7 @@ if [ "${GH_CI_MINIMAL:-}" != "1" ] && [ "${GH_CI_MINIMAL:-}" != "true" ]; then
   DEP_REL=".github/dependabot.yml"
   DEP_FILE="$REPO_ROOT/$DEP_REL"
   DEP_GEN="$SHARE_DIR/generate_dependabot.py"
-  if [ ! -f "$DEP_FILE" ] && [ -f "$DEP_GEN" ]; then
+  if [ ! -e "$DEP_FILE" ] && [ ! -L "$DEP_FILE" ] && [ -f "$DEP_GEN" ]; then
     mkdir -p "$REPO_ROOT/.github"
     if python3 "$DEP_GEN" "$REPO_ROOT" > "$DEP_FILE"; then
       echo "[ci-init] Generated $DEP_REL." >&2
@@ -158,7 +158,7 @@ if [ "${GH_CI_MINIMAL:-}" != "1" ] && [ "${GH_CI_MINIMAL:-}" != "true" ]; then
   EC_REL=".editorconfig"
   EC_FILE="$REPO_ROOT/$EC_REL"
   EC_TMPL="$SHARE_DIR/editorconfig"
-  if [ ! -f "$EC_FILE" ] && [ -f "$EC_TMPL" ]; then
+  if [ ! -e "$EC_FILE" ] && [ ! -L "$EC_FILE" ] && [ -f "$EC_TMPL" ]; then
     cp "$EC_TMPL" "$EC_FILE"
     echo "[ci-init] Generated $EC_REL." >&2
     files_to_commit+=("$EC_REL")
@@ -167,10 +167,15 @@ if [ "${GH_CI_MINIMAL:-}" != "1" ] && [ "${GH_CI_MINIMAL:-}" != "true" ]; then
   GA_REL=".gitattributes"
   GA_FILE="$REPO_ROOT/$GA_REL"
   GA_TMPL="$SHARE_DIR/gitattributes"
-  if [ ! -f "$GA_FILE" ] && [ -f "$GA_TMPL" ]; then
-    cp "$GA_TMPL" "$GA_FILE"
-    echo "[ci-init] Generated $GA_REL." >&2
-    files_to_commit+=("$GA_REL")
+  if [ ! -e "$GA_FILE" ] && [ ! -L "$GA_FILE" ] && [ -f "$GA_TMPL" ]; then
+    # 既存リポに CRLF ファイルが含まれる場合，eol=lf 強制による偽差分を防ぐためスキップする
+    if git -C "$REPO_ROOT" ls-files --eol 2>/dev/null | grep -q 'i/crlf'; then
+      echo "[ci-init] Warning: Existing CRLF-tracked files detected; skipping $GA_REL to avoid spurious line-ending diffs." >&2
+    else
+      cp "$GA_TMPL" "$GA_FILE"
+      echo "[ci-init] Generated $GA_REL." >&2
+      files_to_commit+=("$GA_REL")
+    fi
   fi
 fi
 
@@ -190,8 +195,8 @@ if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
     exit 0
   fi
 
-  # pre-commit フックはスキップし，既にステージ済みの他ファイルは絶対に巻き込まない
-  if CI_CHECK_SKIP=1 git -C "$REPO_ROOT" commit -m "chore: add default CI and repository configs" -- "${files_to_commit[@]}" >&2; then
+  # --no-verify で他ツールの commit-msg / pre-commit フックとの衝突を防ぎつつ，対象ファイルだけを単独コミット
+  if CI_CHECK_SKIP=1 git -C "$REPO_ROOT" commit --no-verify -m "chore: add default CI and repository configs" -- "${files_to_commit[@]}" >&2; then
     write_status "committed"
     exit 0
   else

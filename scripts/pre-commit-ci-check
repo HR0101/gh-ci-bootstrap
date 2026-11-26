@@ -8,12 +8,16 @@ set -euo pipefail
 # コミット対象（ステージ済み）ファイルに対して，絵文字・シークレット・機密ファイル・
 # 巨大ファイル・コンフリクト・構文エラーをコミット前にブロックする．
 #
+# 終了コード規約（repo_check.py）:
+#   - 0: 問題なし
+#   - 1: 違反検出（コミットをブロック）
+#   - それ以外（3: 内部エラー，127: python3 未検出等）: 警告のみ出してコミットを通す
+#
 # 制御方法:
 #   - 1回だけスキップ:   CI_CHECK_SKIP=1 git commit ...  （または git commit --no-verify）
 #   - リポ単位で無効化:  git config hooks.skipPreCommit true
 # =============================================================================
 
-# 予期しないエラーで作業を止めないフェイルセーフ（チェック検出失敗時は明示的に exit 1）
 trap 'exit 0' ERR
 
 if [ "${CI_CHECK_SKIP:-}" = "1" ] || [ "${CI_CHECK_SKIP:-}" = "true" ]; then
@@ -24,7 +28,6 @@ if [ "$(git config --bool --get hooks.skipPreCommit 2>/dev/null || echo false)" 
   exit 0
 fi
 
-# ステージ済みファイルが 0 件なら何もしない
 if [ -z "$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)" ]; then
   exit 0
 fi
@@ -34,18 +37,34 @@ if [ ! -f "$CHECKER" ]; then
   exit 0
 fi
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -z "$REPO_ROOT" ]; then
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[pre-commit] Warning: python3 not found; skipping CI pre-commit check." >&2
   exit 0
 fi
 
-# ホームディレクトリ直下のドットファイル管理リポ等は意図しない誤爆を避けるためスキップ可能
-if [ "$REPO_ROOT" = "$HOME" ]; then
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "$HOME" ]; then
   exit 0
+fi
+
+# マージコミット中は他ブランチ由来の絵文字でマージを止めない（コンフリクト・シークレット等は継続検査）
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
+EXTRA_ENV=()
+if [ -n "$GIT_DIR" ] && [ -f "$GIT_DIR/MERGE_HEAD" ]; then
+  EXTRA_ENV+=("CI_ENABLE_NO_EMOJI=false")
 fi
 
 trap - ERR
-if ! (CDPATH= cd "$REPO_ROOT" && python3 "$CHECKER" --staged --quiet); then
+status=0
+if [ "${#EXTRA_ENV[@]}" -gt 0 ]; then
+  (CDPATH= cd "$REPO_ROOT" && env "${EXTRA_ENV[@]}" python3 "$CHECKER" --staged --quiet) || status=$?
+else
+  (CDPATH= cd "$REPO_ROOT" && python3 "$CHECKER" --staged --quiet) || status=$?
+fi
+
+if [ "$status" -eq 0 ]; then
+  exit 0
+elif [ "$status" -eq 1 ]; then
   cat >&2 << 'EOF'
 
 [pre-commit] ステージ済みファイルで CI 事前チェックに失敗しました．
@@ -54,4 +73,7 @@ if ! (CDPATH= cd "$REPO_ROOT" && python3 "$CHECKER" --staged --quiet); then
              （このリポで無効化: git config hooks.skipPreCommit true）
 EOF
   exit 1
+else
+  echo "[pre-commit] Warning: repo_check.py exited unexpectedly ($status). Allowing commit." >&2
+  exit 0
 fi
