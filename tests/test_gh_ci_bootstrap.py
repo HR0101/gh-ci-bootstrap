@@ -225,6 +225,26 @@ def test_stack_detection_and_changed_files_filter():
         assert kv["has_apple"] == "true" and kv["apple_kind"] == "xcodeproj" and kv["apple_project"] == "My App.xcodeproj"
         assert kv["has_dart_flutter"] == "true" and kv["dart_kind"] == "flutter" and kv["has_dart_tests"] == "true"
 
+        # Test non-empty macos-26 real -showdestinations ordering (id before OS) & incompatible exclusion
+        apple_xcode_py = extract_py_heredoc(common["jobs"]["apple"]["steps"][6]["run"])
+        apple_ns = {}
+        exec(compile(apple_xcode_py, "<apple>", "exec"), apple_ns)
+
+        class FakeRes:
+            returncode = 0
+            stdout = (
+                '\tDestinations compatible with the "App" scheme:\n'
+                '\t\t{ platform:iOS Simulator, id:dvtdevice-placeholder, name:Any iOS Simulator Device }\n'
+                '\t\t{ platform:iOS Simulator, arch:arm64, id:7299CF4D-3623-4131-AC54-5173DE87C867, OS:27.2, name:iPhone 17 }\n'
+                '\t\t{ platform:iOS Simulator, arch:arm64, id:FD47DAA5-C15F-4409-A0D7-6A250FD8D1F4, OS:27.2, name:iPhone 18 Pro Max }\n'
+                '\tDestinations incompatible with the "App" scheme:\n'
+                '\t\t{ platform:iOS Simulator, arch:arm64, id:AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA, OS:99.0, name:iPhone Future }\n'
+            )
+
+        apple_ns["runCmd"] = lambda *a, **kw: FakeRes()
+        picked = apple_ns["findIosSimulatorFromShowDestinations"](["-project", "App.xcodeproj"], "scheme", "App")
+        assert picked == "FD47DAA5-C15F-4409-A0D7-6A250FD8D1F4", f"Unexpected picked simulator: {picked}"
+
         # Real git push diff: docs-only commit skips heavy language jobs
         run(["git", "commit", "-q", "-m", "initial"], cwd=r)
         before_sha = run(["git", "rev-parse", "HEAD"], cwd=r).stdout.strip()
