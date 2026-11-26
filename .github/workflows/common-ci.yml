@@ -1914,12 +1914,23 @@ jobs:
             if res.returncode != 0:
               return None
             candidates = []
+            inIncompatible = False
             for line in res.stdout.splitlines():
-              m = re.search(r"platform:iOS Simulator,.*?OS:([^,]+),.*?id:([0-9A-Fa-f-]{36}),.*?name:([^}]+)", line)
-              if m and "iPhone" in m.group(3):
-                osVer = m.group(1).strip()
-                udid = m.group(2).strip()
-                devName = m.group(3).strip()
+              if "Destinations incompatible" in line:
+                inIncompatible = True
+                continue
+              if "Destinations compatible" in line:
+                inIncompatible = False
+                continue
+              if inIncompatible or "platform:iOS Simulator" not in line or "placeholder" in line:
+                continue
+              mId = re.search(r"\bid:([0-9A-Fa-f-]{36})\b", line)
+              mOs = re.search(r"\bOS:([^,}\s]+)", line)
+              mName = re.search(r"\bname:([^,}]+)", line)
+              if mId and mName and "iPhone" in mName.group(1):
+                osVer = mOs.group(1).strip() if mOs else "0"
+                udid = mId.group(1).strip()
+                devName = mName.group(1).strip()
                 verTuple = tuple(int(x) for x in re.findall(r"\d+", osVer))
                 candidates.append((verTuple, devName, udid))
             if not candidates:
