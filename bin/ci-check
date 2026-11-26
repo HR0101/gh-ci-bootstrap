@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# ci-check（~/.local/bin/ci-check）
+#
+# カレントの Git リポジトリに対して，CI（repo-checks）と同じ検査をローカルで即実行する．
+#
+# 使い方:
+#   ci-check            # 未追跡ファイル含む（.gitignore 除外）全ファイルを検査
+#   ci-check --staged   # ステージ済み（git add 済み）の変更だけ検査
+#   ci-check --tracked  # Git 追跡済みファイルのみ検査
+# =============================================================================
+
+if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "Error: [ci-check] Not inside a git repository." >&2
+  exit 2
+fi
+
+CHECKER="$HOME/.local/share/gh-wrapper/repo_check.py"
+if [ ! -f "$CHECKER" ]; then
+  SCRIPT_DIR="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  CHECKER="$(CDPATH= cd "$SCRIPT_DIR/.." && pwd -P)/scripts/repo_check.py"
+fi
+
+if [ ! -f "$CHECKER" ]; then
+  echo "Error: [ci-check] repo_check.py not found." >&2
+  exit 1
+fi
+
+CDPATH= cd "$repo_root"
+exec python3 "$CHECKER" "$@"
