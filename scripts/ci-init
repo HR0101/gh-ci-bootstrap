@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# 共通 CI 初期化スクリプト（~/.local/share/gh-wrapper/ci-init）
+#
+# `gh` ラッパーおよび `pre-push` フックの双方から呼び出され，対象リポジトリの
+# ルートへ `.github/workflows/ci.yml` を配置し，必要に応じて単独コミットする．
+#
+# 使い方:
+#   ci-init <target_dir> [--commit-mode auto|require] [--allow-existing-dir] [--status-file <path>]
+#
+# 出力規約:
+#   - 全てのログと git 出力は stderr (>&2) へ出し，stdout を汚染しない．
+#   - --status-file を渡すと，処理結果（committed / created / skipped）を書き出す．
+# =============================================================================
+
+usage() {
+  echo "Usage: ci-init <target_dir> [--commit-mode auto|require] [--allow-existing-dir] [--status-file <path>]" >&2
+}
+
+if [ "$#" -lt 1 ]; then
+  usage
+  exit 2
+fi
+
+TARGET_ARG="$1"
+shift
+
+COMMIT_MODE="auto"
+ALLOW_EXISTING_DIR=false
+STATUS_FILE=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --commit-mode)
+      if [ "$#" -lt 2 ]; then
+        echo "[ci-init] Error: --commit-mode requires a value (auto|require)." >&2
+        exit 2
+      fi
+      COMMIT_MODE="$2"
+      shift 2
+      ;;
+    --allow-existing-dir)
+      ALLOW_EXISTING_DIR=true
+      shift
+      ;;
+    --status-file)
+      if [ "$#" -lt 2 ]; then
+        echo "[ci-init] Error: --status-file requires a path." >&2
+        exit 2
+      fi
+      STATUS_FILE="$2"
+      shift 2
+      ;;
+    *)
+      echo "[ci-init] Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$COMMIT_MODE" in
+  auto|require) ;;
+  *)
+    echo "[ci-init] Error: Invalid --commit-mode '$COMMIT_MODE' (expected auto or require)." >&2
+    exit 2
+    ;;
+esac
+
+write_status() {
+  if [ -n "$STATUS_FILE" ]; then
+    printf '%s\n' "$1" > "$STATUS_FILE"
+  fi
+}
+
+if [ ! -d "$TARGET_ARG" ]; then
+  echo "[ci-init] Warning: Directory not found: $TARGET_ARG" >&2
+  write_status "skipped"
+  exit 1
+fi
+
+TARGET_DIR="$(CDPATH= cd "$TARGET_ARG" && pwd -P)"
+
+# bare リポジトリやすり抜けを確実に除外するため出力文字列を厳密チェック
+if [ "$(git -C "$TARGET_DIR" rev-parse --is-inside-work-tree 2>/dev/null || echo false)" != "true" ]; then
+  echo "[ci-init] Warning: Not a git working tree: $TARGET_DIR" >&2
+  write_status "skipped"
+  exit 1
+fi
+
+# サブディレクトリ指定でリポジトリルート以外に .github を作ってしまう事故を防ぐ
+# （macOS の大文字小文字差の影響を受けないよう --show-prefix でルート判定する）
+REPO_PREFIX="$(git -C "$TARGET_DIR" rev-parse --show-prefix 2>/dev/null)"
+if [ -n "$REPO_PREFIX" ]; then
+  echo "[ci-init] Warning: '$TARGET_DIR' is not the repository root (prefix: '$REPO_PREFIX'). Skipping CI initialization." >&2
+  write_status "skipped"
+  exit 0
+fi
+
+REPO_ROOT="$(git -C "$TARGET_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+  echo "[ci-init] Warning: Could not resolve git repository root for: $TARGET_DIR" >&2
+  write_status "skipped"
+  exit 1
+fi
+
+TEMPLATE_FILE="${GH_CI_TEMPLATE:-$HOME/.local/share/gh-wrapper/ci.yml}"
+if [ ! -f "$TEMPLATE_FILE" ]; then
+  echo "[ci-init] Warning: Template not found at $TEMPLATE_FILE. Skipping." >&2
+  write_status "skipped"
+  exit 1
+fi
+
+WORKFLOW_DIR="$REPO_ROOT/.github/workflows"
+CI_REL_FILE=".github/workflows/ci.yml"
+CI_FILE="$REPO_ROOT/$CI_REL_FILE"
+
+if [ -d "$WORKFLOW_DIR" ] && [ "$ALLOW_EXISTING_DIR" != true ]; then
+  echo "[ci-init] $WORKFLOW_DIR already exists. Skipping." >&2
+  write_status "skipped"
+  exit 0
+fi
+
+# 作業ツリーに未追跡の ci.yml が既にある場合は上書きしない
+if [ ! -f "$CI_FILE" ]; then
+  echo "[ci-init] Initializing default CI workflow at $CI_FILE..." >&2
+  mkdir -p "$WORKFLOW_DIR"
+  cp "$TEMPLATE_FILE" "$CI_FILE"
+  echo "[ci-init] Default CI workflow created." >&2
+else
+  echo "[ci-init] Found existing $CI_FILE in working tree; reusing it." >&2
+fi
+
+if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+  echo "[ci-init] Committing $CI_REL_FILE only..." >&2
+  if ! git -C "$REPO_ROOT" add -- "$CI_REL_FILE" >&2; then
+    echo "[ci-init] Warning: Failed to stage $CI_REL_FILE (e.g. ignored by .gitignore)." >&2
+    write_status "created"
+    if [ "$COMMIT_MODE" = "require" ]; then
+      exit 1
+    fi
+    exit 0
+  fi
+
+  if git -C "$REPO_ROOT" commit -m "chore: add default CI workflow" -- "$CI_REL_FILE" >&2; then
+    write_status "committed"
+    exit 0
+  else
+    echo "[ci-init] Warning: Failed to commit $CI_REL_FILE." >&2
+    write_status "created"
+    if [ "$COMMIT_MODE" = "require" ]; then
+      exit 1
+    fi
+    exit 0
+  fi
+else
+  echo "[ci-init] Initial repository without commits detected. Leaving $CI_REL_FILE for initial commit." >&2
+  write_status "created"
+  if [ "$COMMIT_MODE" = "require" ]; then
+    exit 1
+  fi
+  exit 0
+fi

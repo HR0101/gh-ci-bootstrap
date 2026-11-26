@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 予期しないエラーで通常の git push 全体を止めないためのフェイルセーフ
+# （意図した中断は trap を解除した上で明示的に exit 1 する）
+trap 'exit 0' ERR
+
+# =============================================================================
+# グローバル pre-push フック本体（~/.local/share/gh-wrapper/pre-push-ci-init）
+#
+# `~/.git-templates/hooks/pre-push` のスタブから exec で呼ばれる本体スクリプト．
+# Web 版 GitHub で空リポを作って初回 git push した際の `.github/workflows/ci.yml`
+# 入れ忘れを防ぐ．
+#
+# 発火条件（全てを満たすときのみ実行）:
+#   1. GH_SKIP_CI_INIT が未設定かつ `git config hooks.skipCiInit` が true でない
+#   2. 対象オーナー（GH_CI_OWNER または `git config hooks.ciOwner`）が設定済みかつ
+#      push 先 URL が `github.com/<owner>/...` に厳密一致
+#   3. 現在の HEAD（SHA 一致）を通常ブランチ（refs/heads/*）へ新規作成 push している
+#   4. push 対象コミットのツリー内に `.github/workflows` が存在しない
+#   5. リモートにブランチが 1 つも無い（＝空リポへの初回 push．gh-pages・fork PR 等を除外）
+#
+# 制御方法:
+#   - 事前スキップ（1回だけ）: GH_SKIP_CI_INIT=1 git push
+#   - リポ単位で無効化:        git config hooks.skipCiInit true
+#   - 対象オーナー設定:        git config --global hooks.ciOwner <your-github-username>
+# =============================================================================
+
+REMOTE_NAME="${1:-}"
+REMOTE_URL="${2:-}"
+
+# 1. 明示的スキップの確認
+if [ "${GH_SKIP_CI_INIT:-}" = "1" ] || [ "${GH_SKIP_CI_INIT:-}" = "true" ]; then
+  exit 0
+fi
+
+if [ "$(git config --bool --get hooks.skipCiInit 2>/dev/null || echo false)" = "true" ]; then
+  exit 0
+fi
+
+# 2. 対象オーナーの解決および github.com URL の厳密照合
+OWNER="${GH_CI_OWNER:-$(git config --get hooks.ciOwner 2>/dev/null || true)}"
+if [ -z "$OWNER" ] || [ -z "$REMOTE_URL" ]; then
+  exit 0
+fi
+
+REMOTE_URL_LOWER="$(printf '%s' "$REMOTE_URL" | tr '[:upper:]' '[:lower:]')"
+OWNER_LOWER="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+
+OWNER_REGEX="$(printf '%s' "$OWNER_LOWER" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+# github.com の HTTPS / SSH および SSH ホストエイリアス（git@github-<alias>:owner/...）に対応（gist.github.com は除外）
+if ! printf '%s' "$REMOTE_URL_LOWER" | grep -Eq "^(https://([^@/]+@)?github\.com/|(ssh://)?git@github(\.com|-[a-z0-9._-]+)[:/])${OWNER_REGEX}/"; then
+  exit 0
+fi
+
+# 3. ブランチ上にいること（detached HEAD での誤コミット防止）と，現在の HEAD を refs/heads/* へ新規 push するか判定
+CURRENT_BRANCH="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
+if [ -z "$CURRENT_BRANCH" ]; then
+  exit 0
+fi
+HEAD_SHA="$(git rev-parse -q --verify HEAD 2>/dev/null || true)"
+if [ -z "$HEAD_SHA" ]; then
+  exit 0
+fi
+
+pushing_new_head_branch=false
+remote_already_has_refs=false
+
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_ref:-}" ] && continue
+  # remote_sha が全 0 でなければリモートに既にブランチがある（＝空リポではない）ため通信なしで除外可能
+  if [ -n "${remote_sha:-}" ] && ! printf '%s' "$remote_sha" | grep -Eq '^0+$'; then
+    remote_already_has_refs=true
+  fi
+  # 削除 push（local_sha が全 0）は対象外
+  if printf '%s' "${local_sha:-}" | grep -Eq '^0+$'; then
+    continue
+  fi
+  if [ "$local_sha" = "$HEAD_SHA" ]; then
+    case "${remote_ref:-}" in
+      refs/heads/*)
+        pushing_new_head_branch=true
+        ;;
+    esac
+  fi
+done
+
+if [ "$remote_already_has_refs" = true ] || [ "$pushing_new_head_branch" != true ]; then
+  exit 0
+fi
+
+# 4. push 対象のコミットツリー内に既に `.github/workflows` が含まれているか確認
+#    （作業ツリーではなくコミット済みツリーを見ることで未追跡ファイルによる素通りを防ぐ）
+if git cat-file -e "${HEAD_SHA}:.github/workflows" 2>/dev/null; then
+  exit 0
+fi
+
+# 5. リモートが空（ブランチが 1 つも無い初回 push）の場合のみ対象にする
+#    ネットワーク障害等で ls-remote が失敗した場合は何もせず本物の push に委ねる
+REMOTE_TARGET="${REMOTE_NAME:-$REMOTE_URL}"
+if ! remote_heads="$(git ls-remote --heads "$REMOTE_TARGET" 2>/dev/null)"; then
+  exit 0
+fi
+if [ -n "$remote_heads" ]; then
+  exit 0
+fi
+
+# 6. リポジトリルートを特定し，共通スクリプト ci-init で生成＆単独コミット
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+
+CI_INIT="$HOME/.local/share/gh-wrapper/ci-init"
+if [ ! -x "$CI_INIT" ]; then
+  echo "[pre-push] Warning: $CI_INIT not found or not executable. Skipping." >&2
+  exit 0
+fi
+
+echo "[pre-push] 空リポジトリへの初回 push で .github/workflows が未コミットのため，デフォルト CI を追加します..." >&2
+trap - ERR
+if "$CI_INIT" "$REPO_ROOT" --commit-mode require --allow-existing-dir; then
+  cat >&2 << 'EOF'
+
+[pre-push] .github/workflows/ci.yml を生成して単独コミットしました．
+[pre-push] Git の仕様上，進行中の push には新しいコミットが含まれないため一度中断します．
+[pre-push] 同じ git push コマンドをもう一度実行すると，CI を含めてプッシュされます．
+           （この自動コミットを取り消す場合: git reset HEAD~1）
+           （このリポで CI 自動生成を無効化する場合: git config hooks.skipCiInit true）
+EOF
+  exit 1
+else
+  cat >&2 << 'EOF'
+
+[pre-push] .github/workflows/ci.yml の生成または自動コミットに失敗しました．
+[pre-push] 状態を確認して手動コミット後に再度 git push してください．
+           （今回だけスキップしてそのまま push する場合: GH_SKIP_CI_INIT=1 git push）
+EOF
+  exit 1
+fi
