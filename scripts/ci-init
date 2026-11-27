@@ -196,7 +196,7 @@ if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
   fi
 
   # --no-verify で他ツールの commit-msg / pre-commit フックとの衝突を防ぎつつ，対象ファイルだけを単独コミット
-  if CI_CHECK_SKIP=1 git -C "$REPO_ROOT" commit --no-verify -m "chore: add default CI and repository configs" -- "${files_to_commit[@]}" >&2; then
+  if CI_CHECK_SKIP=1 git -C "$REPO_ROOT" commit --no-verify -m "初期設定: 汎用 CI ワークフローと基本設定ファイルを追加" -- "${files_to_commit[@]}" >&2; then
     write_status "committed"
     exit 0
   else
